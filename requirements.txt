@@ -1,0 +1,2 @@
+mitmproxy>=10.0
+fpdf2>=2.7
