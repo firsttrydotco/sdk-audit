@@ -19,7 +19,7 @@ bash ~/.claude/skills/sdk-audit/run.sh
 
 Run with `run_in_background: true`.
 
-Tell the user: **"Tu peux lancer l'app. Dis-moi 'c'est bon' quand t'as fini."**
+Tell the user: **"You can launch the app. Tell me when you're done."**
 
 When the user signals done (or you're asked to auto-stop after enough traffic):
 
