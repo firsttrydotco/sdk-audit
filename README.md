@@ -1,5 +1,19 @@
 # sdk-audit
 
+Most mobile user acquisition managers never verify what their developer's Meta SDK actually sends.
+
+They assume "it's integrated" means "it works."
+
+I built a Claude Code prompt that runs a full SDK & attribution audit on any mobile app using mitmproxy.
+
+Plug it in, capture 1 session on your device, and it tells you exactly what fires, what's silent, and what's missing for AEM eligibility.
+
+Takes 10 minutes. Beats weeks of back-and-forth with your dev team. Before you blame iOS privacy for your ROAS.
+
+<img width="500" height="500" alt="1776183228871" src="https://github.com/user-attachments/assets/8dd5c8d3-1831-407d-9b37-77d625879120" />
+
+
+
 Audit a mobile app's MMP / SDK integration by intercepting its network traffic with [mitmproxy](https://mitmproxy.org), then generate a PDF report with status checks and code recommendations.
 
 Useful when you want to know — without source-code access — whether an app:
