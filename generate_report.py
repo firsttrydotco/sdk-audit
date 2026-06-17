@@ -565,40 +565,66 @@ def _extract_other_sdk_version(name: str, r: dict) -> str | None:
     return None
 
 
+def _rc_identity_state(path: str) -> str | None:
+    """Classify a RevenueCat request path by subscriber identity.
+
+    Returns 'identified' for an /subscribers/identify call or a concrete
+    (non-anonymous) app_user_id in the subscriber path, 'anonymous' for a
+    $RCAnonymousID subscriber path, or None when the request carries no
+    subscriber identity at all (e.g. /v1/product_entitlement_mapping,
+    /v1/events).
+    """
+    if "/subscribers/identify" in path:
+        return "identified"
+    if "$RCAnonymousID" in path:
+        return "anonymous"
+    if re.search(r"/subscribers/[^/?]+", path):
+        return "identified"
+    return None
+
+
 def analyze_other(entries: list) -> dict:
     """Analyze other SDK requests."""
     sdks = {}
+    rc_anon_seen = False
+    rc_identified = False
     for r in entries:
         host = r["host"]
         source = r.get("source", "")
         if "revenuecat" in host or source == "REVENUECAT":
             name = "RevenueCat"
-            is_anonymous = "$RCAnonymousID" in r.get("path", "")
+            state = _rc_identity_state(r.get("path", ""))
+            if state == "anonymous":
+                rc_anon_seen = True
+            elif state == "identified":
+                rc_identified = True
         elif "customer.io" in host or source == "CUSTOMER.IO":
             name = "Customer.io"
-            is_anonymous = False
         elif "intercom" in host or source == "INTERCOM":
             name = "Intercom"
-            is_anonymous = False
         elif "crashlytics" in host:
             name = "Crashlytics"
-            is_anonymous = False
         elif "app-analytics-services" in host or "firebaseinstallations" in host or "firebaseremoteconfig" in host or source == "FIREBASE":
             name = "Firebase Analytics"
-            is_anonymous = False
         else:
             name = host
-            is_anonymous = False
 
         if name not in sdks:
             sdks[name] = {"count": 0, "anonymous": False, "version": None}
         sdks[name]["count"] += 1
-        if is_anonymous:
-            sdks[name]["anonymous"] = True
         if not sdks[name]["version"]:
             v = _extract_other_sdk_version(name, r)
             if v:
                 sdks[name]["version"] = v
+
+    # RevenueCat counts as "anonymous" (a problem worth flagging) ONLY if it saw
+    # an anonymous ID and never identified the user. A later /subscribers/identify
+    # call -- or a named app_user_id in a subscriber path -- means the user IS
+    # identified, even when earlier calls in the same session were anonymous
+    # (the normal anonymous -> identify lifecycle). Flagging on any anonymous
+    # request was a false positive.
+    if "RevenueCat" in sdks:
+        sdks["RevenueCat"]["anonymous"] = rc_anon_seen and not rc_identified
 
     return sdks
 
@@ -873,10 +899,19 @@ const { customerInfo, created } = await Purchases.logIn(user.id);""",
 
 def generate_markdown(meta: dict, adjust: dict, others: dict, app_name: str, platform: str,
                       appsflyer: dict = None, branch: dict = None, other_mmps: dict = None,
-                      paywall: dict = None) -> str:
+                      paywall: dict = None, raw_capture: dict = None) -> str:
     code = CODE_EXAMPLES.get(platform, CODE_EXAMPLES["unity"])
     lines = []
     a = lines.append
+
+    def md_idents(items, heading="Identifiers sent"):
+        if not items:
+            return
+        a(f"**{heading}:**")
+        a("")
+        for label, value in items:
+            a(f"- {label}: `{value}`")
+        a("")
 
     a(f"# SDK Audit — {app_name}")
     a(f"")
@@ -918,6 +953,7 @@ def generate_markdown(meta: dict, adjust: dict, others: dict, app_name: str, pla
     if meta["event_names"]:
         a(f"**Events observed:** {', '.join(meta['event_names'])}")
         a("")
+    md_idents(collect_identifiers(raw_capture, "meta") + collect_meta_device(raw_capture))
 
     # Adjust
     aj_extras = []
@@ -938,6 +974,7 @@ def generate_markdown(meta: dict, adjust: dict, others: dict, app_name: str, pla
     a(f"| fb_anon_id (Meta link) | {'OK' if adjust['fb_anon_id'] else 'NO'} |")
     a(f"| SKAdNetwork | {'OK' if adjust['skan_configured'] else 'NO'} |")
     a("")
+    md_idents(collect_identifiers(raw_capture, "adjust"))
 
     # AppsFlyer
     if appsflyer and appsflyer.get("present"):
@@ -956,6 +993,7 @@ def generate_markdown(meta: dict, adjust: dict, others: dict, app_name: str, pla
         a(f"| Customer User ID | {'OK — ' + str(appsflyer['customer_user_id']) if appsflyer['customer_user_id'] else '**KO** — not set'} |")
         a(f"| Deep links / Web-to-App | {'OK — ' + ', '.join(appsflyer['web_to_app_signals'].keys()) if appsflyer['web_to_app_signals'] else '**KO** — no signals'} |")
         a("")
+        md_idents(collect_identifiers(raw_capture, "appsflyer"))
 
     # Branch
     if branch and branch.get("present"):
@@ -973,6 +1011,7 @@ def generate_markdown(meta: dict, adjust: dict, others: dict, app_name: str, pla
         a(f"| Deep links | {'OK' if branch['deep_link_detected'] else '**KO** — not detected'} |")
         a(f"| Events | {'OK — ' + ', '.join(branch['events']) if branch['events'] else '**KO** — none'} |")
         a("")
+        md_idents(collect_identifiers(raw_capture, "branch"))
 
     # Other MMPs
     if other_mmps:
@@ -995,6 +1034,7 @@ def generate_markdown(meta: dict, adjust: dict, others: dict, app_name: str, pla
             ver = info.get("version") or "?"
             a(f"| {name} | {ver} | {info['count']} | {note} |")
         a("")
+        md_idents(collect_rc_attributes(raw_capture), heading="RevenueCat subscriber attributes")
 
     # Paywall compliance (Apple 3.1.1 / IAP bypass). Only render the section
     # when the session has a relevant signal — a paywall SDK, payment
@@ -1149,119 +1189,429 @@ def generate_markdown(meta: dict, adjust: dict, others: dict, app_name: str, pla
     return "\n".join(lines)
 
 
+# --- IDFA / ATT helpers (always reported on iOS) ---
+
+ZERO_IDFA = "00000000-0000-0000-0000-000000000000"
+
+# Apple ATTrackingManagerAuthorizationStatus, as forwarded by Adjust `att_status`
+# (and most iOS MMPs). 0/2 mean no usable IDFA; only 3 yields a real one.
+ATT_STATUS_LABELS = {
+    "0": "notDetermined (ATT prompt never answered/shown)",
+    "1": "restricted (parental controls / MDM / supervised)",
+    "2": "denied (user refused, or the global iOS Tracking toggle is OFF)",
+    "3": "authorized (user allowed -> real IDFA flows)",
+}
+
+
+def att_status_label(code) -> str:
+    """Human meaning for a numeric ATT status code. Returns 'N/A' if absent."""
+    if code is None:
+        return "N/A"
+    return ATT_STATUS_LABELS.get(str(code).strip(), f"unknown ({code})")
+
+
+def extract_rc_idfa(raw_capture: dict) -> str:
+    """Pull the RevenueCat `$idfa` subscriber attribute from the raw capture,
+    if the app forwards it. Returns the value (possibly zeroed) or None."""
+    if not raw_capture:
+        return None
+    for e in raw_capture.get("other_sdks", []):
+        if "revenuecat" not in str(e.get("host", "")).lower():
+            continue
+        body = e.get("body")
+        attrs = body.get("attributes") if isinstance(body, dict) else None
+        if isinstance(attrs, dict) and isinstance(attrs.get("$idfa"), dict):
+            return attrs["$idfa"].get("value")
+    return None
+
+
+# --- Identifier inventory (the actual values each SDK sends) ---
+#
+# The report must surface the *raw identifiers* each SDK transmits (fbAnonId,
+# advertiser_id, app_user_id, device fingerprint, etc.), not just OK/KO status.
+# Keys below are matched case-insensitively against request params + body.
+
+_IDENTIFIER_KEYS = {
+    # device / advertising IDs (cross-SDK)
+    "idfa": "IDFA",
+    "idfv": "IDFV",
+    "advertiser_id": "IDFA (advertiser_id)",
+    "gps_adid": "GPS ADID (Android)",
+    "android_id": "Android ID",
+    "app_set_id": "App Set ID",
+    "adid": "Device ID (adid)",
+    "device_id": "Device ID",
+    "fire_adid": "Fire ADID",
+    # Meta / Facebook
+    "anon_id": "fbAnonId (anon_id)",
+    "app_user_id": "App user ID (app_user_id)",
+    "access_token": "FB App ID / client token",
+    "fb_anon_id": "fbAnonId (Meta link)",
+    "fb_login_id": "fb_login_id",
+    # user / cross-service identity
+    "external_id": "External ID",
+    "external_device_id": "External device ID",
+    "customer_user_id": "Customer user ID",
+    "customeruserid": "Customer user ID",
+    "uid": "SDK UID",
+    "identity": "Identity",
+    "developer_identity": "Developer identity",
+    # app / config descriptors
+    "app_token": "Adjust app token",
+    "dev_key": "Dev key",
+    "appsflyerkey": "AppsFlyer dev key",
+    "bundle_id": "Bundle ID",
+    "package_name": "Package name",
+    "store": "Store",
+    "environment": "Environment",
+    # tracking flags (config, not an ID — but part of the inventory)
+    "att": "ATT status",
+    "att_status": "ATT status",
+    "advertiser_tracking_enabled": "advertiser_tracking_enabled",
+    "advertiser_id_collection_enabled": "advertiser_id_collection_enabled",
+    "application_tracking_enabled": "application_tracking_enabled",
+}
+
+# Meta `extinfo` array layout (iOS/Android), index -> label.
+_EXTINFO_LABELS = [
+    "extinfo version", "bundle ID", "app build", "app version", "OS version",
+    "device model", "locale", "timezone", "carrier", "screen width",
+    "screen height", "screen density", "CPU cores", "disk total (GB)",
+    "disk free (GB)", "timezone name",
+]
+
+
+def _fmt_identifier(key, value):
+    """Return (label, display_value) for one identifier field, with
+    SDK-specific niceties (App ID split, zeroed-IDFA annotation, ATT meaning)."""
+    lk = key.lower()
+    label = _IDENTIFIER_KEYS[lk]
+    if lk == "access_token":
+        s = str(value)
+        appid = s.split("|")[0]
+        tok = s.split("|")[1] if "|" in s else ""
+        tail = f" (+ client token ...{tok[-4:]})" if tok else ""
+        return label, f"App ID {appid}{tail}"
+    if lk in ("advertiser_id", "idfa"):
+        z = "  (zeroed - ATT not authorized)" if value == ZERO_IDFA else ""
+        return label, f"{value}{z}"
+    if lk in ("att", "att_status"):
+        return label, f"{value} = {att_status_label(value)}"
+    return label, str(value)
+
+
+def collect_identifiers(raw_capture, category):
+    """First-seen identifier fields across all requests of a capture category.
+    Returns an ordered list of (label, display_value)."""
+    if not raw_capture:
+        return []
+    out, seen = [], set()
+    for e in raw_capture.get(category, []) or []:
+        blob = {}
+        if isinstance(e.get("params"), dict):
+            blob.update(e["params"])
+        if isinstance(e.get("body"), dict):
+            blob.update(e["body"])
+        for k, v in blob.items():
+            lk = k.lower()
+            if lk in _IDENTIFIER_KEYS and lk not in seen and v not in (None, "", "{}", "[]"):
+                seen.add(lk)
+                out.append(_fmt_identifier(k, v))
+    return out
+
+
+def collect_meta_device(raw_capture):
+    """Decode Meta's extinfo device fingerprint + declared url_schemes (first seen).
+    Emitted as short, individual lines (one per extinfo field / per scheme) so no
+    single value is long enough to break PDF line wrapping."""
+    info = []
+    have = set()
+    for e in (raw_capture or {}).get("meta", []) or []:
+        b = e.get("body")
+        if not isinstance(b, dict):
+            continue
+        if "extinfo" in b and "extinfo" not in have:
+            try:
+                arr = json.loads(b["extinfo"]) if isinstance(b["extinfo"], str) else b["extinfo"]
+                if isinstance(arr, list):
+                    for i, val in enumerate(arr):
+                        label = _EXTINFO_LABELS[i] if i < len(_EXTINFO_LABELS) else f"extinfo[{i}]"
+                        info.append((f"extinfo - {label}", str(val)))
+                    have.add("extinfo")
+            except Exception:
+                pass
+        if "url_schemes" in b and "url_schemes" not in have:
+            try:
+                sch = json.loads(b["url_schemes"]) if isinstance(b["url_schemes"], str) else b["url_schemes"]
+                if isinstance(sch, list) and sch:
+                    for s in sch:
+                        info.append(("URL scheme", str(s)))
+                    have.add("url_schemes")
+            except Exception:
+                pass
+    return info
+
+
+def collect_rc_attributes(raw_capture):
+    """All RevenueCat subscriber attributes ($idfa, $idfv, $fbAnonId, $appsflyerId, ...)."""
+    out, seen = [], set()
+    for e in (raw_capture or {}).get("other_sdks", []) or []:
+        if "revenuecat" not in str(e.get("host", "")).lower():
+            continue
+        b = e.get("body")
+        attrs = b.get("attributes") if isinstance(b, dict) else None
+        if not isinstance(attrs, dict):
+            continue
+        for k, v in attrs.items():
+            if k in seen:
+                continue
+            val = v.get("value") if isinstance(v, dict) else v
+            if val in (None, ""):
+                continue
+            seen.add(k)
+            z = "  (zeroed)" if val == ZERO_IDFA else ""
+            out.append((k, f"{val}{z}"))
+    return out
+
+
 # --- PDF report ---
+#
+# Layout constants — single source of truth for the PDF's vertical rhythm,
+# geometry and palette so the rendering is predictable instead of a scatter of
+# magic ln()/cell() numbers. Values match the historical look where it worked.
+
+GAP_TIGHT = 1       # ln() between tightly-related lines
+GAP_PARA = 2        # ln() between paragraphs / after a subsection heading
+GAP_SECTION = 4     # ln() before a section heading
+GAP_MAJOR = 6       # ln() after the title metadata block
+
+LINE_BODY = 5.5     # multi_cell line height for body text
+LINE_STATUS = 6     # row height for a status line
+
+LABEL_WIDTH_FRACTION = 0.45   # status-line label column as a fraction of content width
+KEEP_SECTION_MM = 40          # min space below a section heading before a forced page break
+KEEP_SUBSECTION_MM = 24       # min space below a subsection heading
+
+COLOR_TEXT = (40, 40, 40)
+COLOR_HEADING = (30, 30, 30)
+COLOR_SUBHEAD = (50, 50, 50)
+COLOR_MUTED = (100, 100, 100)
+COLOR_OK = (0, 130, 0)
+COLOR_KO = (200, 0, 0)
+COLOR_HI_RED = (200, 0, 0)
+COLOR_HI_ORANGE = (200, 120, 0)
+
+
+# Built-in Helvetica + Courier are Latin-1 fonts. The handful of non-Latin-1
+# typographic chars we use (em/en dash, ellipsis, curly quotes, bullet, euro)
+# are normalized to ASCII; anything else is dropped via a final encode backstop
+# so PDF generation can never raise UnicodeEncodeError on captured data.
+_LATIN1_FALLBACKS = str.maketrans({
+    "\u2014": "-", "\u2013": "-", "\u2026": "...", "\u2022": "-", "\u20AC": "EUR",
+    "\u2018": "'", "\u2019": "'", "\u201C": '"', "\u201D": '"',
+})
+
+
+def _latin1(s):
+    if not isinstance(s, str):
+        return s
+    s = s.translate(_LATIN1_FALLBACKS)
+    return s.encode("latin-1", "replace").decode("latin-1")
+
 
 def generate_pdf(meta: dict, adjust: dict, others: dict, app_name: str, platform: str, output_path: str,
                   appsflyer: dict = None, branch: dict = None, other_mmps: dict = None,
-                  paywall: dict = None):
+                  paywall: dict = None, raw_capture: dict = None):
     from fpdf import FPDF
 
-    FONT_DIR = os.environ.get("AUDIT_FONT_DIR", "/System/Library/Fonts/Supplemental")
     code = CODE_EXAMPLES.get(platform, CODE_EXAMPLES["unity"])
 
     class AuditPDF(FPDF):
+        # Transparently normalize non-Latin-1 typography to ASCII so the report
+        # code can use normal Unicode literals while the core fonts stay happy.
+        def cell(self, *args, **kwargs):
+            if "text" in kwargs:
+                kwargs["text"] = _latin1(kwargs["text"])
+            elif len(args) >= 3:
+                args = (args[0], args[1], _latin1(args[2]), *args[3:])
+            return super().cell(*args, **kwargs)
+
+        def multi_cell(self, *args, **kwargs):
+            if "text" in kwargs:
+                kwargs["text"] = _latin1(kwargs["text"])
+            elif len(args) >= 3:
+                args = (args[0], args[1], _latin1(args[2]), *args[3:])
+            return super().multi_cell(*args, **kwargs)
+
+        # --- geometry helpers (derived, never hardcoded) ---
+        def content_width(self):
+            return self.w - self.l_margin - self.r_margin
+
+        def content_right(self):
+            return self.w - self.r_margin
+
+        def _soft(self, text):
+            """Make any text safe to hand to multi_cell. ONLY breaks a whitespace-free
+            run that is genuinely WIDER than the content area (measured, not guessed),
+            splitting it into width-fitting pieces. Legitimate prose wraps untouched —
+            nothing is truncated, so the legal paragraphs / verdicts render in full.
+            Deterministic with the default wrapmode: never raises 'not enough space'
+            and never hangs (unlike wrapmode=CHAR, which loops when width is ~0).
+            Requires the current font to be set (callers set it first)."""
+            text = _latin1(str(text))
+            cw = self.content_width()
+            out = []
+            for tok in text.split(" "):
+                if not tok or self.get_string_width(tok) <= cw:
+                    out.append(tok)
+                    continue
+                # Oversize token (rare: a long URL/path/blob) — split into pieces
+                # each just under the content width so default wrapping can't raise.
+                cur = ""
+                for ch in tok:
+                    if cur and self.get_string_width(cur + ch) > cw:
+                        out.append(cur)
+                        cur = ch
+                    else:
+                        cur += ch
+                if cur:
+                    out.append(cur)
+            return " ".join(out)
+
+        def reset_style(self):
+            self.set_font("Helvetica", "", 10)
+            self.set_text_color(*COLOR_TEXT)
+
+        def keep_together(self, min_mm):
+            """Avoid orphaned headings: page-break now if less than min_mm remains."""
+            if self.get_y() + min_mm > self.h - self.b_margin:
+                self.add_page()
+
+        def safe_text(self, text, *, h=LINE_BODY, style="", size=10, color=None, gap=GAP_TIGHT):
+            """THE single safe text writer. Always starts at the left margin and
+            wraps unbreakable tokens, so it can never raise 'not enough space'."""
+            self.set_font("Helvetica", style, size)
+            self.set_text_color(*(color or COLOR_TEXT))
+            self.set_x(self.l_margin)
+            self.multi_cell(0, h, self._soft(text))
+            if gap:
+                self.ln(gap)
+            self.reset_style()
+
         def header(self):
-            self.set_font("Arial", "B", 10)
+            self.set_font("Helvetica", "B", 10)
             self.set_text_color(120, 120, 120)
             self.cell(0, 8, f"SDK Audit — {app_name} — {date.today().isoformat()}", align="R", new_x="LMARGIN", new_y="NEXT")
-            self.line(10, self.get_y(), 200, self.get_y())
-            self.ln(4)
+            self.line(self.l_margin, self.get_y(), self.content_right(), self.get_y())
+            self.ln(GAP_SECTION)
 
         def footer(self):
             self.set_y(-15)
-            self.set_font("Arial", "I", 8)
+            self.set_font("Helvetica", "I", 8)
             self.set_text_color(150, 150, 150)
             self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", align="C")
 
         def section(self, title):
-            self.set_font("Arial", "B", 14)
-            self.set_text_color(30, 30, 30)
-            self.ln(4)
+            self.keep_together(KEEP_SECTION_MM)
+            self.set_font("Helvetica", "B", 14)
+            self.set_text_color(*COLOR_HEADING)
+            self.ln(GAP_SECTION)
+            self.set_x(self.l_margin)
             self.cell(0, 10, title, new_x="LMARGIN", new_y="NEXT")
-            self.line(10, self.get_y(), 200, self.get_y())
-            self.ln(2)
+            self.line(self.l_margin, self.get_y(), self.content_right(), self.get_y())
+            self.ln(GAP_PARA)
+            self.reset_style()
 
         def subsection(self, title):
-            self.set_font("Arial", "B", 11)
-            self.set_text_color(50, 50, 50)
-            self.ln(2)
+            self.keep_together(KEEP_SUBSECTION_MM)
+            self.set_font("Helvetica", "B", 11)
+            self.set_text_color(*COLOR_SUBHEAD)
+            self.ln(GAP_PARA)
+            self.set_x(self.l_margin)
             self.cell(0, 8, title, new_x="LMARGIN", new_y="NEXT")
+            self.reset_style()
 
         def body_text(self, text):
-            self.set_font("Arial", "", 10)
-            self.set_text_color(40, 40, 40)
-            self.multi_cell(0, 5.5, text)
-            self.ln(1)
+            self.safe_text(text, gap=GAP_TIGHT)
+
+        def bold_text(self, text):
+            self.safe_text(text, style="B", gap=GAP_TIGHT)
 
         def status_line(self, label, status, ok=True):
-            self.set_font("Arial", "", 10)
-            self.set_text_color(40, 40, 40)
-            self.cell(90, 6, f"  {label}")
-            if ok:
-                self.set_text_color(0, 130, 0)
-                self.set_font("Arial", "B", 10)
-                self.cell(0, 6, "[OK] " + status, new_x="LMARGIN", new_y="NEXT")
+            """Label + [OK]/[KO] value. Short values sit on one row (as before);
+            a long value (e.g. a big comma-joined token list) wraps safely on its
+            own indented line instead of overflowing off the page edge."""
+            self.set_x(self.l_margin)
+            self.set_font("Helvetica", "", 10)
+            self.set_text_color(*COLOR_TEXT)
+            label_w = self.content_width() * LABEL_WIDTH_FRACTION
+            self.cell(label_w, LINE_STATUS, f"  {label}")
+            value = ("[OK] " if ok else "[KO] ") + str(status)
+            self.set_text_color(*(COLOR_OK if ok else COLOR_KO))
+            self.set_font("Helvetica", "B", 10)
+            if self.get_string_width(value) <= self.content_width() - label_w:
+                self.cell(0, LINE_STATUS, value, new_x="LMARGIN", new_y="NEXT")
             else:
-                self.set_text_color(200, 0, 0)
-                self.set_font("Arial", "B", 10)
-                self.cell(0, 6, "[KO] " + status, new_x="LMARGIN", new_y="NEXT")
-            self.set_text_color(40, 40, 40)
-            self.set_font("Arial", "", 10)
+                self.ln(LINE_STATUS)            # drop below the label row
+                self.set_x(self.l_margin)
+                self.multi_cell(0, LINE_STATUS, self._soft("      " + value))
+            self.reset_style()
 
         def code_block(self, code_text):
             self.set_font("Courier", "", 8)
             self.set_fill_color(245, 245, 245)
             self.set_text_color(30, 30, 30)
-            self.ln(1)
-            for line in code_text.strip().split("\n"):
-                truncated = line[:105] + "..." if len(line) > 108 else line
-                self.cell(0, 4.5, "  " + truncated, fill=True, new_x="LMARGIN", new_y="NEXT")
-            self.ln(2)
-            self.set_font("Arial", "", 10)
+            self.ln(GAP_TIGHT)
+            try:
+                # Monospace: hard per-line truncation (NOT wrapped) keeps code
+                # formatting intact; a wrapped code line would be misleading.
+                for line in code_text.strip().split("\n"):
+                    truncated = line[:105] + "..." if len(line) > 108 else line
+                    self.set_x(self.l_margin)
+                    self.cell(0, 4.5, "  " + truncated, fill=True, new_x="LMARGIN", new_y="NEXT")
+            finally:
+                self.ln(GAP_PARA)
+                self.reset_style()
 
-        def bold_text(self, text):
-            self.set_font("Arial", "B", 10)
-            self.set_text_color(40, 40, 40)
-            self.multi_cell(0, 5.5, text)
-            self.set_font("Arial", "", 10)
-            self.ln(1)
+        def identifiers(self, items, heading="Identifiers sent"):
+            """Render a labelled key/value inventory of the IDs an SDK transmits."""
+            if not items:
+                return
+            self.safe_text(f"  {heading}:", h=5.5, style="B", size=9, color=(90, 90, 90), gap=0)
+            for label, value in items:
+                self.safe_text(f"    - {label}: {value}", h=5, size=9, color=(60, 60, 60), gap=0)
+            self.ln(GAP_TIGHT)
+            self.reset_style()
 
     pdf = AuditPDF()
     pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=20)
-    try:
-        pdf.add_font("Arial", "", os.path.join(FONT_DIR, "Arial.ttf"))
-        pdf.add_font("Arial", "B", os.path.join(FONT_DIR, "Arial Bold.ttf"))
-        pdf.add_font("Arial", "I", os.path.join(FONT_DIR, "Arial Italic.ttf"))
-        pdf.add_font("Courier", "", os.path.join(FONT_DIR, "Courier New.ttf"))
-    except (FileNotFoundError, OSError) as e:
-        raise RuntimeError(
-            f"TTF fonts not found in {FONT_DIR}. "
-            f"Set AUDIT_FONT_DIR env var to a directory containing Arial.ttf, Arial Bold.ttf, "
-            f"Arial Italic.ttf, and Courier New.ttf. Error: {e}"
-        )
+    # Built-in Helvetica + Courier (PDF base-14): no TTF, no setup, every OS.
     pdf.add_page()
 
     # Title
-    pdf.set_font("Arial", "B", 20)
+    pdf.set_font("Helvetica", "B", 20)
     pdf.set_text_color(20, 20, 20)
     pdf.cell(0, 15, f"SDK Audit — {app_name}", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Arial", "", 11)
-    pdf.set_text_color(100, 100, 100)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.set_text_color(*COLOR_MUTED)
     if meta.get("bundle_id"):
-        pdf.cell(0, 7, f"{meta['bundle_id']} — App version {meta.get('app_version', 'N/A')}", new_x="LMARGIN", new_y="NEXT")
+        # multi_cell + _soft so an unusually long bundle_id wraps instead of
+        # silently overflowing the page edge (font stays 11/muted for the rows below).
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(0, 7, pdf._soft(f"{meta['bundle_id']} — App version {meta.get('app_version', 'N/A')}"))
     pdf.cell(0, 7, f"Date: {date.today().isoformat()} | Method: mitmproxy", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, f"Platform: {platform.title()}", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(6)
+    pdf.ln(GAP_MAJOR)
 
     # Legal basis
     pdf.section("Legal basis for this audit")
     pdf.body_text(LEGAL_PARA_1.format(app_name=app_name))
-    pdf.ln(2)
+    pdf.ln(GAP_PARA)
     pdf.body_text(LEGAL_PARA_2)
-    pdf.ln(2)
+    pdf.ln(GAP_PARA)
     pdf.body_text(LEGAL_PARA_3)
-    pdf.ln(4)
+    pdf.ln(GAP_SECTION)
 
     # Results
     pdf.section("Results")
@@ -1273,6 +1623,7 @@ def generate_pdf(meta: dict, adjust: dict, others: dict, app_name: str, platform
         pdf.status_line("Custom Events", "business events present" if not meta["auto_events_only"] else "only SDK auto events", ok=not meta["auto_events_only"])
         has_idfa = meta["idfa"] and meta["idfa"] != "00000000-0000-0000-0000-000000000000"
         pdf.status_line("IDFA transmitted", "OK" if has_idfa else "NO (zeros)", ok=has_idfa)
+        pdf.identifiers(collect_identifiers(raw_capture, "meta") + collect_meta_device(raw_capture))
 
     aj_extras_pdf = []
     if adjust.get("sdk_version"):
@@ -1287,6 +1638,7 @@ def generate_pdf(meta: dict, adjust: dict, others: dict, app_name: str, platform
         pdf.status_line("IDFA transmitted", "OK" if adjust["idfa"] else "NO", ok=bool(adjust["idfa"]))
         pdf.status_line("fb_anon_id (Meta link)", "OK" if adjust["fb_anon_id"] else "NO", ok=bool(adjust["fb_anon_id"]))
         pdf.status_line("SKAdNetwork", "configured" if adjust["skan_configured"] else "NO", ok=adjust["skan_configured"])
+        pdf.identifiers(collect_identifiers(raw_capture, "adjust"))
 
     if appsflyer and appsflyer.get("present"):
         af_extras_pdf = []
@@ -1300,6 +1652,7 @@ def generate_pdf(meta: dict, adjust: dict, others: dict, app_name: str, platform
         pdf.status_line("Custom Events", ', '.join(appsflyer['custom_events']) if appsflyer['has_custom_events'] else "none", ok=appsflyer['has_custom_events'])
         pdf.status_line("Customer User ID", str(appsflyer['customer_user_id']) if appsflyer['customer_user_id'] else "not set", ok=bool(appsflyer['customer_user_id']))
         pdf.status_line("Deep links / Web-to-App", ', '.join(appsflyer['web_to_app_signals'].keys()) if appsflyer['web_to_app_signals'] else "no signals", ok=bool(appsflyer['web_to_app_signals']))
+        pdf.identifiers(collect_identifiers(raw_capture, "appsflyer"))
 
     if branch and branch.get("present"):
         br_extras_pdf = []
@@ -1311,6 +1664,7 @@ def generate_pdf(meta: dict, adjust: dict, others: dict, app_name: str, platform
         pdf.status_line("SDK integrated", f"OK ({branch['request_count']} req.)", ok=True)
         pdf.status_line("Identity set", "OK" if branch['identity_set'] else "not set", ok=branch['identity_set'])
         pdf.status_line("Deep links", "OK" if branch['deep_link_detected'] else "not detected", ok=branch['deep_link_detected'])
+        pdf.identifiers(collect_identifiers(raw_capture, "branch"))
 
     if other_mmps:
         for name, info in other_mmps.items():
@@ -1321,11 +1675,86 @@ def generate_pdf(meta: dict, adjust: dict, others: dict, app_name: str, platform
 
     if others:
         pdf.subsection("Other SDKs")
+        rc_attrs = collect_rc_attributes(raw_capture)
         for name, info in others.items():
             note = "anonymous" if info.get("anonymous") else "OK"
             ver = info.get("version")
             ver_suffix = f", v{ver}" if ver else ""
             pdf.status_line(name, f"{note} ({info['count']} req.{ver_suffix})", ok=not info.get("anonymous"))
+            if name == "RevenueCat" and rc_attrs:
+                pdf.identifiers(rc_attrs, heading="RevenueCat subscriber attributes")
+
+    # IDFA & ATT status — ALWAYS rendered on iOS (see SKILL.md 2f). Two distinct
+    # questions: (1) is IDFA collection plumbed/enabled per SDK, (2) is a usable
+    # non-zero IDFA actually transmitted. att_status is the ground truth.
+    is_ios = platform in ("swift", "react-native", "unity") and (
+        meta.get("present") or adjust.get("present") or raw_capture is not None
+    )
+    if is_ios:
+        rc_idfa = extract_rc_idfa(raw_capture)
+        meta_idfa = meta.get("idfa")
+        adjust_idfa = adjust.get("idfa")
+        att_code = adjust.get("att_status")
+
+        def _usable(v):
+            return bool(v) and v != ZERO_IDFA
+
+        any_plumbed = any([
+            meta.get("present") and meta_idfa is not None,
+            rc_idfa is not None,
+            adjust.get("present") and adjust_idfa is not None,
+        ])
+        any_usable = any(_usable(v) for v in (meta_idfa, rc_idfa, adjust_idfa))
+
+        pdf.section("IDFA & ATT Status")
+        # (1) plumbing per SDK
+        if meta.get("present"):
+            pdf.status_line("Meta IDFA collection", "enabled (advertiser_id sent)" if meta_idfa is not None else "not sent", ok=meta_idfa is not None)
+        if rc_idfa is not None:
+            pdf.status_line("RevenueCat $idfa attribute", "sent", ok=True)
+        if adjust.get("present"):
+            pdf.status_line("Adjust IDFA collection", "enabled" if adjust_idfa is not None else "not sent", ok=adjust_idfa is not None)
+        # (2) usable value + ground truth
+        pdf.status_line("Usable (non-zero) IDFA transmitted", "YES" if any_usable else "NO (zeroed)", ok=any_usable)
+        pdf.status_line("ATT status", att_status_label(att_code), ok=str(att_code).strip() == "3")
+
+        # Plain-language verdict — this is the part users keep asking about.
+        if any_usable:
+            pdf.body_text(
+                "Verdict: the app collects and transmits a real IDFA (ATT authorized). "
+                "Identifier flows to the SDK(s) above."
+            )
+        elif any_plumbed:
+            if str(att_code).strip() == "0" or att_code is None:
+                why = (
+                    "ATT is notDetermined: on a fresh install this means the app never called "
+                    "ATTrackingManager.requestTrackingAuthorization() on the screens exercised, "
+                    "so no ATT prompt was shown. The IDFA collection is plumbed but DEAD - it will "
+                    "stay zeroed until the app requests (and the user grants) tracking. NB: the prompt "
+                    "may be deferred to a deeper screen (post-onboarding); re-capture a full session to confirm."
+                )
+            elif str(att_code).strip() == "2":
+                why = (
+                    "ATT is denied: the user refused tracking, OR the global iOS toggle "
+                    "(Settings > Privacy > Tracking > 'Allow Apps to Request to Track') is OFF "
+                    "(the toggle-off case shows denied WITHOUT any prompt). No usable IDFA will flow."
+                )
+            else:
+                why = "ATT is not authorized, so iOS hands the SDKs an all-zeros IDFA."
+            pdf.body_text(
+                "Verdict: IDFA collection is ENABLED in the SDK(s) above, but the value transmitted "
+                f"is ZEROED ({ZERO_IDFA}). " + why
+            )
+        else:
+            pdf.body_text("Verdict: no IDFA field is sent by any SDK in this capture.")
+
+        # Meta inconsistency: advertiser_tracking_enabled:1 while IDFA is zeroed.
+        if meta.get("present") and meta.get("att_enabled") and not _usable(meta_idfa):
+            pdf.body_text(
+                "[REVIEW] Meta sends advertiser_tracking_enabled=1 while the IDFA is zeroed and ATT is "
+                "not authorized. This flag should mirror the real ATT status; the contradiction degrades "
+                "Meta attribution/dedup. Drive it from ATTrackingManager.trackingAuthorizationStatus."
+            )
 
     # Paywall compliance (Apple 3.1.1). Same gate as the Markdown section:
     # suppress when there is no paywall SDK, no payment traffic, and no
@@ -1345,15 +1774,16 @@ def generate_pdf(meta: dict, adjust: dict, others: dict, app_name: str, platform
         else:
             pdf.set_fill_color(80, 180, 80); pdf.set_text_color(255, 255, 255)
             banner = "[OK] No external payment traffic detected this session"
-        pdf.set_font("Arial", "B", 11)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_x(pdf.l_margin)
         pdf.cell(0, 10, banner, fill=True, new_x="LMARGIN", new_y="NEXT")
-        pdf.set_text_color(40, 40, 40)
-        pdf.ln(3)
+        pdf.reset_style()
+        pdf.ln(GAP_PARA)
 
         for reason in paywall["risk_reasons"]:
             pdf.body_text(f"\u2022 {reason}")
 
-        pdf.ln(2)
+        pdf.ln(GAP_PARA)
         pdf.status_line("Paywall SDK", paywall["paywall_sdk"] or "none detected", ok=bool(paywall["paywall_sdk"]))
         pdf.status_line("Store", f"{paywall.get('store') or '?'} ({paywall.get('storekit_version') or '?'})",
                         ok=paywall.get("store") == "APP_STORE")
@@ -1362,56 +1792,53 @@ def generate_pdf(meta: dict, adjust: dict, others: dict, app_name: str, platform
         pdf.status_line("Charge attempt (POST)", "YES - bypass confirmed" if paywall["has_charge_attempt"] else "not observed",
                         ok=not paywall["has_charge_attempt"])
         if paywall["paywall_identifier"]:
-            pdf.ln(1)
+            pdf.ln(GAP_TIGHT)
             pdf.body_text(f"Paywall identifier: {paywall['paywall_identifier']}")
 
         if paywall["superwall_variants"]:
-            pdf.ln(2)
+            pdf.ln(GAP_PARA)
             pdf.subsection("Superwall variants assigned (this session)")
             for v in paywall["superwall_variants"]:
                 pdf.body_text(f"variant_id={v['variant_id']}  experiment_id={v['experiment_id']}  paywall={v['paywall_identifier'] or ''}")
 
         if paywall["superwall_products"]:
-            pdf.ln(2)
+            pdf.ln(GAP_PARA)
             pdf.subsection("Products offered")
             for p in paywall["superwall_products"]:
                 trial = f"  trial={p['trial_days']}d" if p.get("trial_days") else ""
                 pdf.body_text(f"{p['product_id']} — {p.get('price') or '?'} {p.get('currency') or ''} / {p.get('period') or '?'}{trial}  ({p.get('store') or '?'})")
 
         if paywall["charge_attempts"]:
-            pdf.ln(2)
+            pdf.ln(GAP_PARA)
             pdf.subsection("Charge attempts observed")
             for ca in paywall["charge_attempts"]:
                 conf = ca.get("confidence", "")
                 # Color by confidence so the reader immediately sees whether
                 # the verdict rests on a known charge endpoint (high, red)
-                # or the non-fingerprint POST heuristic (orange).
+                # or the non-fingerprint POST heuristic (orange). safe_text
+                # carries the color and resets it, so it can't leak to the next line.
                 if conf == "high":
-                    pdf.set_text_color(200, 0, 0)
-                    tag = "[HIGH CONFIDENCE]"
+                    col, tag = COLOR_HI_RED, "[HIGH CONFIDENCE]"
                 elif conf == "heuristic":
-                    pdf.set_text_color(200, 120, 0)
-                    tag = "[HEURISTIC]"
+                    col, tag = COLOR_HI_ORANGE, "[HEURISTIC]"
                 else:
-                    tag = ""
-                pdf.body_text(f"{tag}  {ca['time']}  {ca['processor']}  POST {ca['host']}{ca['path']}")
-                pdf.set_text_color(40, 40, 40)
+                    col, tag = COLOR_TEXT, ""
+                pdf.safe_text(f"{tag}  {ca['time']}  {ca['processor']}  POST {ca['host']}{ca['path']}", color=col)
 
         if paywall["mmp_attribution_forwarded"]:
-            pdf.ln(2)
+            pdf.ln(GAP_PARA)
             pdf.subsection("MMP attribution forwarded to paywall SDK")
             for k, v in paywall["mmp_attribution_forwarded"].items():
                 pdf.body_text(f"{k}: {v}")
 
-        pdf.ln(3)
-        pdf.set_font("Arial", "I", 9)
-        pdf.set_text_color(100, 100, 100)
-        pdf.multi_cell(0, 5, "Session scope: this audit characterizes ONE assigned variant for ONE install source. "
-                             "Apps using Superwall + MMP attribution commonly route paywalls by cohort (organic vs. "
-                             "Meta Purchase vs. App Review). To fully audit for 3.1.1 evasion, repeat the capture for "
-                             "installs originating from paid campaigns optimizing for purchase.")
-        pdf.set_font("Arial", "", 10)
-        pdf.set_text_color(40, 40, 40)
+        pdf.ln(GAP_PARA)
+        pdf.safe_text(
+            "Session scope: this audit characterizes ONE assigned variant for ONE install source. "
+            "Apps using Superwall + MMP attribution commonly route paywalls by cohort (organic vs. "
+            "Meta Purchase vs. App Review). To fully audit for 3.1.1 evasion, repeat the capture for "
+            "installs originating from paid campaigns optimizing for purchase.",
+            style="I", size=9, color=COLOR_MUTED, gap=0,
+        )
 
     # Recommendations
     pdf.add_page()
@@ -1478,7 +1905,7 @@ def main():
 
     if not os.path.exists(args.capture_file):
         print(f"Error: capture file not found: {args.capture_file}")
-        print("Run mitmproxy-sdk-capture/run.sh first, then use the app, then generate the report.")
+        print("Run run.sh first, then use the app, then generate the report.")
         sys.exit(1)
 
     with open(args.capture_file) as f:
@@ -1511,7 +1938,7 @@ def main():
 
     # Markdown
     md_path = os.path.join(args.output_dir, f"{base}.md")
-    md_content = generate_markdown(meta, adjust, others, app_name, args.platform, **extra)
+    md_content = generate_markdown(meta, adjust, others, app_name, args.platform, raw_capture=data, **extra)
     with open(md_path, "w") as f:
         f.write(md_content)
     print(f"Markdown: {md_path}")
@@ -1519,7 +1946,7 @@ def main():
     # PDF
     pdf_path = os.path.join(args.output_dir, f"{base}.pdf")
     try:
-        generate_pdf(meta, adjust, others, app_name, args.platform, pdf_path, **extra)
+        generate_pdf(meta, adjust, others, app_name, args.platform, pdf_path, raw_capture=data, **extra)
         print(f"PDF:      {pdf_path}")
     except ImportError:
         print("Warning: fpdf2 not installed, skipping PDF. Install with: pip3 install fpdf2")

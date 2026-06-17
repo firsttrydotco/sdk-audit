@@ -152,7 +152,7 @@ Outputs:
 - `~/Downloads/<app>-sdk-audit-<YYYY-MM-DD>.md`
 - `~/Downloads/<app>-sdk-audit-<YYYY-MM-DD>.pdf`
 
-The PDF lists, per SDK: integration status, Advanced Matching, custom events, IDFA, ATT status, deep-link signals — then platform-specific code snippets to fix what's missing.
+The PDF lists, per SDK: integration status, Advanced Matching, custom events, IDFA, ATT status, deep-link signals, and an **Identifiers sent** inventory of the exact IDs it transmits (fbAnonId, advertiser_id, app_user_id, decoded device fingerprint, RevenueCat `$`-attributes, …) — then platform-specific code snippets to fix what's missing.
 
 ## Use as a Claude Code skill (optional)
 

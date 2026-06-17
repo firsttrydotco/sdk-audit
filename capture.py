@@ -7,13 +7,22 @@ Usage: mitmdump -s capture.py
 """
 import json
 import os
+import sys
 import time
 from urllib.parse import parse_qs
 from mitmproxy import http
 
 CAPTURE_FILE = "/tmp/mitmproxy_capture.json"
 _TMP_FILE = CAPTURE_FILE + ".tmp"
-captured = {"meta": [], "adjust": [], "appsflyer": [], "branch": [], "other_mmps": [], "other_sdks": [], "unknown": []}
+_USE_COLOR = sys.stdout.isatty()
+
+
+def _red(s):
+    """Wrap text in red ANSI escape codes only when stdout is a tty."""
+    return f"\033[91m{s}\033[0m" if _USE_COLOR else s
+
+
+captured = {"meta": [], "adjust": [], "appsflyer": [], "branch": [], "other_mmps": [], "other_sdks": [], "payment": [], "unknown": []}
 
 
 def _save_json():
@@ -24,6 +33,12 @@ def _save_json():
 
 
 # --- Host classifiers ---
+
+def _host_matches(host, domains):
+    """Match when host equals domain or ends with '.domain' — avoids substring
+    false positives (e.g. 'notcheckout.com' should NOT match 'checkout.com')."""
+    return any(host == d or host.endswith("." + d) for d in domains)
+
 
 def classify_host(host):
     """Return (category, label) for a host. Returns ("unknown", host) for unrecognized hosts."""
@@ -115,6 +130,39 @@ def classify_host(host):
     # --- Apple Ad Attribution ---
     if "app-ads-services.com" in host:
         return "other_sdks", "APPLE_ADS_ATTRIBUTION"
+    # --- Payment processors (flags potential Apple 3.1.1 violations on iOS) ---
+    # Any hit here on iOS = app is NOT using StoreKit for this transaction.
+    # Legit only if: Reader app, External Link Account Entitlement, or non-digital goods.
+    # Anchored on "equals or ends with .domain" to avoid substring false
+    # positives like "notcheckout.com" matching "checkout.com".
+    if _host_matches(host, ["stripe.com", "stripe.network"]):
+        return "payment", "STRIPE"
+    if _host_matches(host, ["paddle.com", "paddle.net", "paddle.dev"]):
+        return "payment", "PADDLE"
+    if _host_matches(host, ["lemonsqueezy.com"]):
+        return "payment", "LEMONSQUEEZY"
+    if _host_matches(host, ["braintreegateway.com", "braintree-api.com"]):
+        return "payment", "BRAINTREE"
+    if _host_matches(host, ["adyen.com"]):
+        return "payment", "ADYEN"
+    if _host_matches(host, ["chargebee.com"]):
+        return "payment", "CHARGEBEE"
+    if _host_matches(host, ["recurly.com"]):
+        return "payment", "RECURLY"
+    if _host_matches(host, ["razorpay.com"]):
+        return "payment", "RAZORPAY"
+    if _host_matches(host, ["squareup.com", "square-cdn.com"]):
+        return "payment", "SQUARE"
+    if _host_matches(host, ["paypal.com"]):
+        return "payment", "PAYPAL"
+    # NOTE: paypalobjects.com is PayPal's CDN for static SDK/button assets.
+    # Apps embedding a PayPal button for PHYSICAL goods would load it without
+    # ever initiating an IAP bypass, so we deliberately do NOT classify it as
+    # payment traffic to avoid alarming users in that legitimate case.
+    if _host_matches(host, ["checkout.com"]):
+        return "payment", "CHECKOUT.COM"
+    if _host_matches(host, ["mollie.com"]):
+        return "payment", "MOLLIE"
     # --- CDN / static assets — skip entirely (noise) ---
     if any(d in host for d in ["b-cdn.net", "cloudflare.com", "cloudfront.net", "fastly.net", "akamai"]):
         return None, None
@@ -260,7 +308,10 @@ def request(flow: http.HTTPFlow):
     all_data = {**params, **body_data}
 
     print(f"\n{'=' * 80}")
-    print(f"[{ts}] {label} | {method} {host}{path[:120]}")
+    if category == "payment":
+        print(f"[{ts}] {_red('[!!! PAYMENT - potential Apple 3.1.1 bypass]')} {label} | {method} {host}{path[:120]}")
+    else:
+        print(f"[{ts}] {label} | {method} {host}{path[:120]}")
 
     if label == "META":
         print_meta(all_data)
@@ -274,8 +325,13 @@ def request(flow: http.HTTPFlow):
             if key in all_data:
                 print(f"  {key}: {all_data[key]}")
 
+    headers_subset = {k: v for k, v in flow.request.headers.items()
+                      if k.lower() in ("user-agent", "x-version", "x-platform", "x-platform-version",
+                                        "x-platform-flavor", "x-platform-flavor-version", "x-client-version",
+                                        "x-client-build-version", "x-client-bundle-id", "x-storekit-version",
+                                        "x-is-sandbox", "x-observer-mode-enabled", "x-kit-version")}
     entry = {"time": ts, "source": label, "method": method, "host": host, "path": path,
-             "params": params, "body": body_data}
+             "params": params, "body": body_data, "request_headers": headers_subset}
 
     captured[category].append(entry)
     _save_json()
@@ -390,6 +446,22 @@ def done():
     _print_section("APPSFLYER", captured["appsflyer"])
     _print_section("BRANCH", captured["branch"])
     _print_section("OTHER MMPs (TikTok/Singular/Kochava/Tenjin)", captured["other_mmps"])
+
+    # Payment processors — flagged separately because they signal potential
+    # StoreKit/IAP bypass on iOS (App Store Guideline 3.1.1).
+    print(f"\n{'=' * 40}")
+    print(f"PAYMENT PROCESSORS (Apple 3.1.1 risk) - {len(captured['payment'])} requests")
+    print(f"{'=' * 40}")
+    if captured["payment"]:
+        proc_hosts = {}
+        for r in captured["payment"]:
+            key = f"{r.get('source', '?')} | {r.get('host', '?')}{r.get('path', '')[:60]}"
+            proc_hosts[key] = proc_hosts.get(key, 0) + 1
+        for key, count in sorted(proc_hosts.items(), key=lambda x: -x[1]):
+            print(f"  {key}: x{count}")
+        print("\n  >> If iOS app: confirm StoreKit is ALSO used, else likely 3.1.1 violation.")
+    else:
+        print("  (none — no direct payment processor calls detected)")
 
     # Other SDKs - simple host count
     print(f"\n{'=' * 40}")
