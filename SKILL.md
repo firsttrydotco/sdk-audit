@@ -200,9 +200,9 @@ Use a custom Python + fpdf2 script if the report needs sections beyond the defau
 
 **PDF specs:**
 - Output: `~/Downloads/{app_name}-sdk-audit-{YYYY-MM-DD}.pdf`
-- Fonts: Arial TTF, loaded from `/System/Library/Fonts/Supplemental/` (macOS default). On Linux/Windows, set `AUDIT_FONT_DIR` to a directory containing `Arial.ttf`, `Arial Bold.ttf`, `Arial Italic.ttf`, `Courier New.ttf` (or equivalents).
-- `fpdf2` is required (`pip install fpdf2`). Ignore the "Core font already added" warning.
-- Arial doesn't support emoji — use `[!]` or `ATTENTION:` instead of warning glyphs.
+- Fonts: built-in **Helvetica + Courier** (PDF base-14) — no TTF, no setup, works on macOS / Linux / Windows. Their encoding is Latin-1; `generate_report.py` normalizes the few non-Latin-1 chars it uses (em-dash, ellipsis, curly quotes, bullet, euro) to ASCII via `_latin1()`, so just write normal Unicode literals.
+- `fpdf2` is required (`pip install fpdf2`).
+- The core fonts don't render emoji — use `[!]` or `ATTENTION:` instead of warning glyphs.
 
 **Report structure:**
 1. **Title + metadata** (app name, bundle ID, version, date, platform, test scenario)
